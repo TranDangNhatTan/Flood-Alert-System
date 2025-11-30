@@ -1,308 +1,373 @@
 /* ==========================================================================
- * PROJECT: HỆ THỐNG CẢNH BÁO NGẬP ÚNG (PHIÊN BẢN TFT SPI 8 CHÂN)
+ * PROJECT: TRẠM CẢNH BÁO LŨ 4 CẤP (FINAL FIX - NO SPAM, CLEAN SMS, STABLE CALL)
  * ==========================================================================
- * CẤU HÌNH PHẦN CỨNG MỚI:
- * - MÀN HÌNH TFT (ST7735):
- * + SCL (SCK)  -> GPIO 18
- * + SDA (MOSI) -> GPIO 23
- * + RES (RST)  -> GPIO 4
- * + DC (A0)    -> GPIO 2
- * + CS         -> GPIO 5
- * - CẢM BIẾN SR04:
- * + TRIG       -> GPIO 32
- * + ECHO       -> GPIO 33
- * - CẢNH BÁO:
- * + BUZZER (+) -> GPIO 27
- * + LED (+)    -> GPIO 14
- * - SIM A7680C:
- * + TX         -> GPIO 16
- * + RX         -> GPIO 17
+ * LOGIC:
+ * - Cấp 0, 1: Chỉ báo đèn.
+ * - Cấp 2: Đèn Đỏ + Gửi SMS (1 lần duy nhất khi chuyển cấp).
+ * - Cấp 3: Đèn Đỏ + Còi + Gửi SMS (1 lần duy nhất khi chuyển cấp).
+ * - Cấp 4: Đèn Đỏ Nháy + Còi + Gửi SMS + Gọi Điện (1 lần duy nhất).
  * ==========================================================================
  */
 
-#include <Adafruit_GFX.h>    // Thư viện đồ họa
-#include <Adafruit_ST7735.h> // Thư viện màn hình ST7735
+#include <Adafruit_GFX.h>    
+#include <Adafruit_ST7735.h> 
 #include <SPI.h>
 #include <EEPROM.h>
-#include <ESP32Time.h>       // Thư viện thời gian
+#include <ESP32Time.h>       
 
-// === 1. CẤU HÌNH CHÂN (GPIO) ===
+// ===  1 Thông tin Blynk và Wifi ===
+#define BLYNK_TEMPLATE_ID "TMPL6TIusvQtp"
+#define BLYNK_TEMPLATE_NAME "Trạm cảnh báo lũ lụt"
+#define BLYNK_AUTH_TOKEN "GBFKLaFe7T9x-p0iY47hRmJLzwRPki-p"
+
+#define WIFI_SSID           "Khu tro"   // <--- Tên Wifi
+#define WIFI_PASS           "0905120084"     // <--- Mật khẩu
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+
+// === 1. CẤU HÌNH CHÂN ===
 #define TFT_CS        5
 #define TFT_RST       4
 #define TFT_DC        2
-// Lưu ý: SCK (18) và MOSI (23) được thư viện tự nhận diện qua Hardware SPI
+// SCK->18, MOSI->23
 
-#define TRIGGER_PIN   32      // Chân mới của cảm biến
-#define ECHO_PIN      33      // Chân mới của cảm biến
-#define BUZZER_PIN    27      // Chân mới của Còi
-#define LED_PIN       14      // Chân mới của LED
+#define TRIGGER_PIN   32      
+#define ECHO_PIN      33      
+#define LED_GREEN     25      
+#define LED_YELLOW    26      
+#define LED_RED       14      
+#define BUZZER_PIN    27      
 #define SIM_RX_PIN    16 
 #define SIM_TX_PIN    17 
 
-// === 2. CẤU HÌNH HỆ THỐNG ===
+// === 2. CẤU HÌNH NGƯỠNG (cm) ===
+float LEVEL_1_DIST = 30.0; // Vàng
+float LEVEL_2_DIST = 20.0; // Đỏ + SMS
+float LEVEL_3_DIST = 15.0; // Đỏ + Còi + SMS
+float LEVEL_4_DIST = 10.0; // Đỏ nháy + Còi + Gọi
+
 #define SIM_BAUDRATE  115200
-#define HOUR_SEND     19      // Giờ gửi báo cáo hàng ngày
-#define MINUTE_SEND   00
 #define EEPROM_SIZE   512
+#define ADDR_MIN      0
+#define ADDR_MAX      10
+#define ADDR_DAY      20
 
-// Địa chỉ lưu trong EEPROM
-#define ADDR_MIN_DISTANCE 0
-#define ADDR_MAX_DISTANCE 10
-#define ADDR_LAST_DAY     20
-
-// === 3. KHỞI TẠO ĐỐI TƯỢNG ===
-// Khởi tạo màn hình ST7735
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 ESP32Time rtc(0);
 
-// === 4. BIẾN TOÀN CỤC ===
-float danger_distance = 10.0; // Ngưỡng nguy hiểm (cm)
-float hysteresis_on = 2.0;
-float hysteresis_off = 5.0;
-bool alerting = false;
+// --- BIẾN TOÀN CỤC ---
+float min_dist = 1000.0;
+float max_dist = 0.0;
+String phone_number = "0392479919"; // SỐ ĐIỆN THOẠI CỦA BẠN
 
-float min_distance = 1000.0;
-float max_distance = 0.0;
-String phone_number = "0392479919"; // THAY SỐ CỦA BẠN VÀO ĐÂY
-bool report_sent = false;
+// Biến logic
+int currentLevel = 0;   
+int previousLevel = -1; // Khởi tạo -1 để lần đầu tiên chạy nó sẽ cập nhật ngay
 
-// Biến lọc trung bình
-float distance_samples[10];
-int sample_index = 0;
-float average_distance = 0.0;
-bool samples_filled = false;
+// Biến quản lý cuộc gọi (Non-blocking)
+bool isCalling = false;
+unsigned long callStartTime = 0;
+const unsigned long callDuration = 25000; // Gọi 25 giây cho chắc ăn
+
+const int NUM_READINGS = 9; 
+float readings[NUM_READINGS];
+
+// Khai báo hàm
+void handleAlertLogic(float dist); 
+float getFilteredDistance();
+void updateDisplayData(float dist, int level);
+void drawStaticInterface();
+void sendSMS(String message);
+void startCall();       
+void checkCallStatus(); 
+void sim_at_cmd(String cmd);
+void checkSerialForTimeUpdate();
+
+// --- [THÊM MỚI 2] BIẾN TRẠNG THÁI WIFI ---
+bool wifi_connected = false;
 
 // ==========================================================================
 //                                  SETUP
 // ==========================================================================
 void setup() {
-  // 1. Khởi động Serial
   Serial.begin(115200);
   Serial2.begin(SIM_BAUDRATE, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
   
-  // 2. Cấu hình chân IO
-  pinMode(TRIGGER_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(TRIGGER_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_GREEN, OUTPUT); pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+  
+  digitalWrite(LED_GREEN, LOW); digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW); digitalWrite(BUZZER_PIN, LOW);
 
-  // 3. Khởi động màn hình TFT
-  // QUAN TRỌNG: Nếu màu bị sai hoặc nhiễu, thử đổi INITR_BLACKTAB thành INITR_GREENTAB
   tft.initR(INITR_BLACKTAB); 
   tft.fillScreen(ST7735_BLACK);
-  tft.setRotation(1); // Xoay ngang màn hình
+  tft.setRotation(0); 
   
-  // Hiển thị màn hình chào
   tft.setTextColor(ST7735_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(10, 20);
-  tft.println("Dang khoi dong...");
-  tft.setCursor(10, 40);
-  tft.println("Tan's Project");
-  delay(1000);
+  tft.setCursor(5, 20); tft.println("Dang khoi dong...");
+  
+  delay(2000); // Chờ SIM ổn định
 
-  // 4. Khởi động EEPROM
   EEPROM.begin(EEPROM_SIZE);
   
-  // 5. Cấu hình SIM
+  // --- CẤU HÌNH SIM (FIX LỖI TIN NHẮN RÁC) ---
   Serial.println("Cau hinh SIM...");
-  sim_at_cmd("AT");
+  sim_at_cmd("ATE0"); // Tắt Echo (Quan trọng!)
   sim_at_cmd("AT+CMGF=1");
+  sim_at_cmd("AT+CSCS=\"GSM\"");
   sim_at_cmd("AT+CNMI=2,2,0,0,0");
+  sim_at_cmd("AT+CLVL=100"); // Max âm lượng
 
-  // 6. Khôi phục dữ liệu cũ
-  min_distance = EEPROM.readFloat(ADDR_MIN_DISTANCE);
-  max_distance = EEPROM.readFloat(ADDR_MAX_DISTANCE);
-  
-  // Lọc giá trị rác
-  if (isnan(min_distance) || min_distance > 1000.0 || min_distance < 0) min_distance = 1000.0;
-  if (isnan(max_distance) || max_distance < 0 || max_distance > 1000.0) max_distance = 0.0;
+  min_dist = EEPROM.readFloat(ADDR_MIN);
+  max_dist = EEPROM.readFloat(ADDR_MAX);
+  if (isnan(min_dist) || min_dist > 1000) min_dist = 1000.0;
+  if (isnan(max_dist) || max_dist < 0) max_dist = 0.0;
 
-  // Reset mảng mẫu
-  for (int i = 0; i < 10; i++) distance_samples[i] = 0.0;
-
-  // Xóa màn hình để vào màn hình chính
   tft.fillScreen(ST7735_BLACK);
-  drawStaticInterface(); // Vẽ khung giao diện tĩnh
+  drawStaticInterface();
+
+  // --- [THÊM MỚI 3] KẾT NỐI BLYNK (KHÔNG CHẶN) ---
+  tft.setCursor(5, 60); tft.println("Ket noi WiFi...");
+  
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  
+  // Chờ kết nối tối đa 10 giây
+  unsigned long startWifi = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < 10000) {
+    delay(500); Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    tft.println("WiFi OK!");
+  } else {
+    wifi_connected = false;
+    tft.println("WiFi Failed!"); // Mất mạng vẫn chạy tiếp
+  }
+  delay(1000);
 }
 
 // ==========================================================================
 //                                   LOOP
 // ==========================================================================
 void loop() {
-  // 1. Đo đạc
-  float distance = measureDistance();
+
+  // --- [THÊM MỚI 4] DUY TRÌ BLYNK ---
+  if (wifi_connected) {
+    if (WiFi.status() == WL_CONNECTED) Blynk.run();
+    else wifi_connected = false;
+  }
+
+  // 1. Kiểm tra tắt cuộc gọi ngầm
+  checkCallStatus();
+
+  // 2. Đo đạc
+  float distance = getFilteredDistance();
   checkSerialForTimeUpdate();
 
-  // 2. Tính trung bình
-  distance_samples[sample_index] = distance;
-  sample_index = (sample_index + 1) % 10;
-  if (sample_index == 0) samples_filled = true;
+  // 3. Xử lý Logic
+  handleAlertLogic(distance);
 
-  average_distance = 0.0;
-  int sample_count = samples_filled ? 10 : sample_index;
-  if (sample_count > 0) {
-    for (int i = 0; i < sample_count; i++) average_distance += distance_samples[i];
-    average_distance /= sample_count;
+  // 4. Lưu EEPROM
+  if (distance < min_dist && distance > 0) { min_dist = distance; EEPROM.writeFloat(ADDR_MIN, min_dist); EEPROM.commit(); }
+  if (distance > max_dist && distance < 1000) { max_dist = distance; EEPROM.writeFloat(ADDR_MAX, max_dist); EEPROM.commit(); }
+
+  // 5. Reset ngày
+  static int lastDay = -1;
+  if (rtc.getDay() != lastDay && rtc.getHour(true) == 0) {
+    min_dist = distance; max_dist = distance;
+    lastDay = rtc.getDay();
   }
 
-  // 3. Cập nhật Min/Max
-  if (distance < min_distance && distance > 0) {
-    min_distance = distance;
-    EEPROM.writeFloat(ADDR_MIN_DISTANCE, min_distance);
-    EEPROM.commit();
-  }
-  if (distance > max_distance && distance < 1000) {
-    max_distance = distance;
-    EEPROM.writeFloat(ADDR_MAX_DISTANCE, max_distance);
-    EEPROM.commit();
-  }
-
-  // 4. Reset Min/Max khi sang ngày mới
-  int currentDay = rtc.getDay();
-  int currentHour = rtc.getHour(true);
-  byte last_day = EEPROM.read(ADDR_LAST_DAY);
+  updateDisplayData(distance, currentLevel);
   
-  if (currentDay != last_day && currentHour >= 20) {
-    min_distance = distance; max_distance = distance;
-    EEPROM.writeFloat(ADDR_MIN_DISTANCE, min_distance);
-    EEPROM.writeFloat(ADDR_MAX_DISTANCE, max_distance);
-    EEPROM.write(ADDR_LAST_DAY, currentDay);
-    EEPROM.commit();
+  delay(200); 
+}
+
+// ==========================================================================
+//                      LOGIC XỬ LÝ (ĐÃ FIX LỖI SPAM)
+// ==========================================================================
+void handleAlertLogic(float dist) {
+  if (dist <= LEVEL_4_DIST) currentLevel = 4;      
+  else if (dist <= LEVEL_3_DIST) currentLevel = 3; 
+  else if (dist <= LEVEL_2_DIST) currentLevel = 2; 
+  else if (dist <= LEVEL_1_DIST) currentLevel = 1; 
+  else currentLevel = 0;                           
+
+  // Chỉ thực hiện hành động khi CÓ SỰ THAY ĐỔI CẤP ĐỘ
+  bool statusChanged = (currentLevel != previousLevel);
+
+  // Reset đèn (trừ cấp 4)
+  if(currentLevel != 4) {
+     digitalWrite(LED_GREEN, LOW); digitalWrite(LED_YELLOW, LOW); digitalWrite(LED_RED, LOW);
   }
 
-  // 5. Gửi báo cáo hàng ngày (19:00)
-  if (currentHour == HOUR_SEND && rtc.getMinute() == MINUTE_SEND && rtc.getSecond() == 0 && !report_sent) {
-    String msg = "BAO CAO NGAY " + rtc.getDate() + ": Min: " + String(min_distance) + "cm, Max: " + String(max_distance) + "cm.";
-    sendSMS(msg);
-    report_sent = true;
-  } else if (currentHour != HOUR_SEND) {
-    report_sent = false;
-  }
+  switch (currentLevel) {
+    case 0: // AN TOÀN
+      digitalWrite(LED_GREEN, HIGH); digitalWrite(BUZZER_PIN, LOW);
+      break;
 
-  // 6. Logic Cảnh báo
-  if (samples_filled && !alerting && average_distance < (danger_distance - hysteresis_on)) {
-    alerting = true;
-    digitalWrite(BUZZER_PIN, HIGH);
-    digitalWrite(LED_PIN, HIGH);
+    case 1: // VÀNG
+      digitalWrite(LED_YELLOW, HIGH); digitalWrite(BUZZER_PIN, LOW);
+      break;
+
+    case 2: // ĐỎ + SMS (CHỈ GỬI 1 LẦN)
+      digitalWrite(LED_RED, HIGH); digitalWrite(BUZZER_PIN, LOW);
+      if (statusChanged) { // Chỉ gửi khi vừa chuyển sang cấp 2
+        sendSMS("CAP 2: Nuoc dang cao (" + String(dist) + "cm)");
+      }
+      break;
+
+    case 3: // ĐỎ + CÒI + SMS (CHỈ GỬI 1 LẦN)
+      digitalWrite(LED_RED, HIGH); digitalWrite(BUZZER_PIN, HIGH);
+      if (statusChanged) { // Chỉ gửi khi vừa chuyển sang cấp 3
+        sendSMS("CAP 3: NGUY HIEM! (" + String(dist) + "cm)");
+      }
+      break;
+
+    case 4: // ĐỎ NHÁY + CÒI + GỌI (CHỈ GỌI 1 LẦN)
+      // Nháy đèn
+      if ((millis() / 200) % 2 == 0) digitalWrite(LED_RED, HIGH);
+      else digitalWrite(LED_RED, LOW);
+      
+      digitalWrite(BUZZER_PIN, HIGH);
+      
+      if (statusChanged) { // Chỉ thực hiện khi vừa chuyển sang cấp 4
+        sendSMS("KHAN CAP: LU LUT! (" + String(dist) + "cm)");
+        startCall(); // Gọi điện 1 lần duy nhất
+      }
+      break;
+  }
+  // --- [THÊM MỚI 5] ĐẨY DỮ LIỆU LÊN APP ---
+  if (wifi_connected) {
+    Blynk.virtualWrite(V0, dist); // Đẩy mực nước
     
-    String msg = "CANH BAO LU! Muc nuoc: " + String(average_distance) + "cm luc " + rtc.getTime();
-    Serial.println(msg);
-    sendSMS(msg);
-    makeCall();
-  } else if (alerting && average_distance > (danger_distance + hysteresis_off)) {
-    alerting = false;
-    digitalWrite(BUZZER_PIN, LOW);
-    digitalWrite(LED_PIN, LOW);
+    String statusTxt = "An Toan";
+    if(currentLevel == 1) statusTxt = "Canh Bao (Vang)";
+    if(currentLevel == 2) statusTxt = "NGUY HIEM (Do)";
+    if(currentLevel >= 3) statusTxt = "KHAN CAP!";
+    Blynk.virtualWrite(V1, statusTxt); // Đẩy dòng chữ trạng thái
   }
-
-  // 7. Hiển thị
-  updateDisplayData(average_distance);
-  delay(1000);
+  
+  // Cập nhật trạng thái cũ để so sánh lần sau
+  previousLevel = currentLevel;
 }
 
 // ==========================================================================
-//                            HÀM HIỂN THỊ (TFT)
+//                  XỬ LÝ GỌI ĐIỆN (ĐÃ FIX LỖI CHẬP CHỜN)
 // ==========================================================================
 
-// Hàm vẽ khung giao diện tĩnh (Chỉ chạy 1 lần để đỡ nháy màn hình)
-void drawStaticInterface() {
-  tft.drawFastHLine(0, 18, 160, ST7735_WHITE); // Kẻ ngang phân cách
-  
-  tft.setTextSize(1);
-  tft.setTextColor(ST7735_WHITE);
-  tft.setCursor(0, 25);
-  tft.print("Muc nuoc hien tai:");
-  
-  tft.setCursor(0, 75);
-  tft.setTextColor(ST7735_YELLOW);
-  tft.print("Min:");
-  tft.setCursor(80, 75);
-  tft.print("Max:");
+void startCall() {
+  // Chỉ gọi nếu không đang bận gọi
+  if (!isCalling) { 
+    Serial.println("Bat dau goi dien...");
+    // Gửi lệnh 1 lần duy nhất
+    Serial2.println("ATD" + phone_number + ";");
+    
+    isCalling = true;
+    callStartTime = millis(); 
+  }
 }
 
-// Hàm cập nhật số liệu (Chạy liên tục)
-void updateDisplayData(float avg) {
-  // 1. Hiển thị Tiêu đề / Trạng thái
-  tft.setTextSize(1);
-  tft.setCursor(0, 5);
-  if (alerting) {
-    tft.setTextColor(ST7735_WHITE, ST7735_RED); // Chữ trắng nền đỏ
-    tft.print(" !! CANH BAO LU !! ");
-  } else {
-    tft.setTextColor(ST7735_GREEN, ST7735_BLACK); // Chữ xanh nền đen
-    tft.print("  GIAM SAT AN TOAN ");
+void checkCallStatus() {
+  // Tự động tắt máy sau 25 giây
+  if (isCalling && (millis() - callStartTime > callDuration)) {
+    Serial.println("Het gio, tat may.");
+    sim_at_cmd("ATH"); 
+    isCalling = false; 
   }
+}
 
-  // 2. Hiển thị Giờ (Góc phải)
-  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
-  tft.setCursor(110, 5);
-  tft.print(rtc.getTime("%H:%M"));
+// ==========================================================================
+//                            HÀM GỬI TIN NHẮN (ĐÃ FIX ECHO)
+// ==========================================================================
+void sendSMS(String message) {
+  // Xóa bộ đệm
+  while(Serial2.available()) Serial2.read();
 
-  // 3. Hiển thị Mức nước (Số to)
-  tft.setTextSize(2);
-  tft.setCursor(20, 45);
-  // Đặt màu nền trùng màu background để tự xóa số cũ khi in số mới
-  if (alerting) tft.setTextColor(ST7735_RED, ST7735_BLACK);
-  else tft.setTextColor(ST7735_CYAN, ST7735_BLACK);
+  Serial2.print("AT+CMGS=\""); 
+  Serial2.print(phone_number); 
+  Serial2.println("\"");
   
-  tft.print(avg, 1); 
-  tft.setTextSize(1);
-  tft.print(" cm");
-
-  // 4. Hiển thị Min/Max
-  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
-  tft.setCursor(25, 75);
-  tft.print(min_distance, 0);
-  tft.setCursor(105, 75);
-  tft.print(max_distance, 0);
+  delay(500); 
+  Serial2.print(message); 
+  delay(500); 
+  
+  Serial2.write(26); 
+  delay(2000); // Chờ gửi xong
 }
 
 // ==========================================================================
 //                            CÁC HÀM PHỤ TRỢ
 // ==========================================================================
 
-float measureDistance() {
-  digitalWrite(TRIGGER_PIN, LOW); delayMicroseconds(2);
-  digitalWrite(TRIGGER_PIN, HIGH); delayMicroseconds(10);
-  digitalWrite(TRIGGER_PIN, LOW);
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  if (duration == 0) return 999.0; 
-  return duration * 0.0343 / 2;
+float getFilteredDistance() {
+  for (int i = 0; i < NUM_READINGS; i++) {
+    digitalWrite(TRIGGER_PIN, LOW); delayMicroseconds(2);
+    digitalWrite(TRIGGER_PIN, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIGGER_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 25000); 
+    readings[i] = (duration == 0) ? 999 : (duration * 0.0343 / 2);
+    delay(5);
+  }
+  for (int i = 0; i < NUM_READINGS - 1; i++) {
+    for (int j = 0; j < NUM_READINGS - i - 1; j++) {
+      if (readings[j] > readings[j + 1]) { float temp = readings[j]; readings[j] = readings[j + 1]; readings[j + 1] = temp; }
+    }
+  }
+  return readings[NUM_READINGS / 2];
+}
+
+void drawStaticInterface() {
+  tft.drawFastHLine(0, 25, 80, ST7735_WHITE); 
+  tft.setTextSize(1); tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(5, 35); tft.print("MUC NUOC:");
+  tft.drawFastHLine(0, 90, 80, ST7735_WHITE);
+}
+
+void updateDisplayData(float dist, int level) {
+  tft.setTextSize(1); tft.setCursor(2, 5);
+  uint16_t color; String txt;
+  switch(level) {
+    case 0: color=ST7735_GREEN; txt=" AN TOAN "; break;
+    case 1: color=ST7735_YELLOW; txt=" CANH BAO"; break;
+    case 2: color=ST7735_ORANGE; txt=" NGUY HIEM"; break;
+    case 3: color=ST7735_RED; txt=" CAP 3 !!"; break;
+    case 4: color=ST7735_RED; txt=" KHAN CAP"; break;
+  }
+  tft.setTextColor(ST7735_WHITE, color); tft.print(txt);
+  
+  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+  tft.setCursor(45, 15); tft.print(rtc.getTime("%H:%M"));
+
+  tft.setTextSize(2); tft.setCursor(15, 50);
+  if (level >= 3) tft.setTextColor(ST7735_RED, ST7735_BLACK);
+  else tft.setTextColor(ST7735_CYAN, ST7735_BLACK);
+  tft.print(dist, 1); 
+  tft.setTextSize(1); tft.setCursor(30, 70); tft.print("cm");
+
+  tft.setTextColor(ST7735_YELLOW, ST7735_BLACK);
+  tft.setCursor(5, 100); tft.print("Min: "); tft.setTextColor(ST7735_WHITE, ST7735_BLACK); tft.print(min_dist, 0);
+  tft.setCursor(5, 120); tft.print("Max: "); tft.setTextColor(ST7735_WHITE, ST7735_BLACK); tft.print(max_dist, 0);
 }
 
 void checkSerialForTimeUpdate() {
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n'); input.trim();
     if (input.length() >= 19) {
-      int year = input.substring(0, 4).toInt();
-      int month = input.substring(5, 7).toInt();
-      int day = input.substring(8, 10).toInt();
-      int hour = input.substring(11, 13).toInt();
-      int minute = input.substring(14, 16).toInt();
-      int second = input.substring(17, 19).toInt();
-      rtc.setTime(second, minute, hour, day, month, year);
-      Serial.println("Da cap nhat gio!");
+      int Y=input.substring(0,4).toInt(); int M=input.substring(5,7).toInt(); int D=input.substring(8,10).toInt();
+      int h=input.substring(11,13).toInt(); int m=input.substring(14,16).toInt(); int s=input.substring(17,19).toInt();
+      rtc.setTime(s, m, h, D, M, Y);
     }
   }
 }
 
 void sim_at_cmd(String cmd) {
-  Serial2.println(cmd); delay(100);
+  Serial2.println(cmd); delay(50); 
   while (Serial2.available()) Serial.write(Serial2.read());
-}
-
-void sendSMS(String message) {
-  sim_at_cmd("AT+CMGF=1");
-  sim_at_cmd("AT+CSCS=\"GSM\"");
-  Serial2.print("AT+CMGS=\""); Serial2.print(phone_number); Serial2.println("\"");
-  delay(500); Serial2.print(message); delay(500);
-  Serial2.write(26); delay(5000);
-}
-
-void makeCall() {
-  String cmd = "ATD" + phone_number + ";";
-  Serial2.println(cmd); delay(20000); Serial2.println("ATH");
 }
